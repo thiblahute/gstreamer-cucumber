@@ -1,0 +1,364 @@
+use async_std::task;
+use async_trait::async_trait;
+use cucumber::{given, then, when, WorldInit};
+use gst::glib;
+use gst::prelude::*;
+use gstvalidate::prelude::*;
+use once_cell::sync::Lazy;
+use std::cmp;
+use std::convert::Infallible;
+use std::env;
+use std::path::Path;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
+
+static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
+    gst::DebugCategory::new(
+        "validate-cucumber",
+        gst::DebugColorFlags::empty(),
+        Some("🥒"),
+    )
+});
+
+#[derive(Debug, WorldInit)]
+pub struct World {
+    pub pipeline: gst::Pipeline,
+    runner: Option<gstvalidate::Runner>,
+    monitor: Option<gstvalidate::Monitor>,
+
+    validateconfigs: gst::Caps,
+
+    pub current_feature_path: Option<PathBuf>,
+    pub extra_data: gst::Structure,
+}
+
+impl World {
+    pub async fn run<I>(input: I, extra_data: Option<gst::Structure>)
+    where
+        I: AsRef<Path>,
+    {
+        let extra_data = Arc::new(extra_data);
+        Self::cucumber()
+            .max_concurrent_scenarios(1)
+            .before(move |feature, _, _scenario, world| {
+                let edata = extra_data.clone();
+                if let Some(d) = edata.as_ref() {
+                    world.extra_data = d.clone();
+                }
+                world.current_feature_path = feature.path.clone();
+
+                Box::pin(async move {
+                    gst::info!(CAT, "Before: {:?} {:?}", feature, world);
+                })
+            })
+            .after(|_, _, _, world| {
+                Box::pin(async move {
+                    if let Some(world) = world.as_ref() {
+                        if let Some(runner) = &world.runner {
+                            let res = runner.exit(true);
+                            debug_assert!(res == 0, "Reported issues: {:?}", runner.reports());
+                        }
+                    }
+                })
+            })
+            .run_and_exit(input)
+            .await
+    }
+}
+
+#[async_trait(?Send)]
+impl cucumber::World for World {
+    type Error = Infallible;
+
+    async fn new() -> Result<Self, Self::Error> {
+        Ok(Self {
+            pipeline: gst::Pipeline::new(None),
+            runner: None,
+            monitor: None,
+            validateconfigs: gst::Caps::new_empty(),
+
+            current_feature_path: None,
+            extra_data: gst::Structure::new_empty("extra"),
+        })
+    }
+}
+
+#[given(regex = r"Pipeline is '(.*)'$")]
+fn set_pipeline(world: &mut World, pipeline: String) -> Result<(), anyhow::Error> {
+    gst::debug!(CAT, "Pipeline is: '{}'", pipeline);
+    world
+        .pipeline
+        .add(&gst::parse_bin_from_description(&pipeline, false)?)
+        .expect("Could not setup pipeline");
+
+    Ok(())
+}
+
+fn find_element(pipeline: &gst::Pipeline, propname: &str) -> (glib::ParamSpec, glib::Object) {
+    let tokens = propname.split("::");
+    let mut pspec = None::<glib::ParamSpec>;
+    let mut obj = None::<glib::Object>;
+
+    for token in tokens {
+        match obj {
+            Some(o) => {
+                debug_assert!(pspec.is_none(), "Invalid property specifier {}", propname);
+                pspec = o
+                    .find_property(token)
+                    .or_else(|| panic!("Couldn't find element {}", token));
+
+                let tmpspec = pspec.unwrap().clone();
+                if tmpspec.value_type() == glib::Object::static_type() {
+                    obj = Some(o.property::<glib::Object>(token));
+                    pspec = None;
+                } else {
+                    obj = Some(o.clone());
+                    pspec = Some(tmpspec);
+                }
+            }
+            None => {
+                obj = pipeline.by_name(token).map_or_else(
+                    || panic!("Couldn't find element {}", token),
+                    |v| Some(v.upcast()),
+                );
+            }
+        }
+    }
+
+    match (pspec, obj) {
+        (Some(pspec), Some(obj)) => (pspec, obj),
+        _ => panic!("Couldn't find object property: {}", propname),
+    }
+}
+
+#[when(expr = "I wait for {word} {word}")]
+async fn wait(_w: &mut World, v: u64, unit: String) {
+    task::sleep(match unit.to_lowercase().as_str() {
+        "min" | "mins" | "minute" | "minutes" => Duration::from_secs(v * 60),
+        "sec" | "secs" | "second" | "seconds" => Duration::from_secs(v),
+        "ms" | "millisecond" | "milliseconds" => Duration::from_millis(v),
+        "us" | "microsecond" | "microseconds" => Duration::from_micros(v),
+        _ => panic!(
+            "Invalid unit: {} only [min, sec, ms, us] are supported",
+            unit
+        ),
+    })
+    .await;
+}
+
+#[when(expr = "I set property {word} to {word}")]
+pub fn set_property(w: &mut World, propname: String, value: String) {
+    let (pspec, obj) = find_element(&w.pipeline, &propname);
+
+    gst::debug!(CAT, "Setting {}={}", propname, value);
+    obj.set_property_from_str(pspec.name(), &value);
+}
+
+#[then(expr = "Property {word} equals {word}")]
+pub fn get_property(w: &mut World, propname: String, value: String) {
+    let (pspec, obj) = find_element(&w.pipeline, &propname);
+
+    let v = glib::Value::deserialize_with_pspec(&value, &pspec).unwrap();
+    let obj_value = obj.property_value(pspec.name());
+    debug_assert!(
+        v.compare(&obj_value).unwrap() == cmp::Ordering::Equal,
+        "{}={} != {}",
+        propname,
+        obj_value.serialize().unwrap(),
+        v.serialize().unwrap()
+    );
+}
+
+#[then(expr = "Validate should not report any issue")]
+fn validate_no_reports(w: &mut World) -> Result<(), anyhow::Error> {
+    match &w.runner {
+        None => debug_assert!(w.runner.is_some(), "Validate hasn't been activated"),
+        Some(runner) => debug_assert!(
+            runner.reports_count() == 0,
+            "Reported issues: {}",
+            runner.printf()
+        ),
+    }
+
+    Ok(())
+}
+
+#[given(regex = r"The validate configuration '(.*)'$")]
+pub fn add_validate_config(w: &mut World, config: String) {
+    dbg!(&config);
+    let structure = gst::Structure::from_str(&config)
+        .unwrap_or_else(|e| panic!("Invalid config: {}: {:?}", config, e));
+
+    w.validateconfigs
+        .get_mut()
+        .unwrap()
+        .append_structure(structure);
+}
+
+#[given(expr = "Validate is activated")]
+pub fn activate_validate(w: &mut World) {
+    debug_assert!(w.runner.is_none(), "Validate has already been activated");
+
+    if !w.validateconfigs.is_empty() {
+        let configs_str = w.validateconfigs.serialize(gst::SerializeFlags::NONE);
+
+        gst::debug!(CAT, "Got configs: {}", configs_str);
+        env::set_var("GST_VALIDATE_CONFIG", &configs_str);
+    }
+
+    gstvalidate::init();
+    let runner = gstvalidate::Runner::new();
+    let _ = w.runner.insert(runner.clone());
+    w.monitor = gstvalidate::Monitor::factory_create(
+        w.pipeline.upcast_ref::<gst::Object>(),
+        &runner,
+        gstvalidate::Monitor::NONE,
+    );
+}
+
+#[when(expr = "I {word} the pipeline")]
+fn set_state(w: &mut World, state: String) {
+    if let Err(err) = w.pipeline.set_state(match state.as_str() {
+        "stop" => gst::State::Null,
+        "prepare" => gst::State::Ready,
+        "pause" => gst::State::Paused,
+        "play" => gst::State::Playing,
+        _ => panic!("Invalid state name: {}", state),
+    }) {
+        panic!("Could not set pipeline to {}: {:?}", state, err);
+    }
+}
+
+// FIXME: Return an Option<> or a Result<> and don't panic?
+pub fn get_last_frame(w: &World, element_name: &str) -> gst::Sample {
+    let element = w
+        .pipeline
+        .by_name_recurse_up(element_name)
+        .or_else(|| {
+            panic!("Could not find element: {}", element_name);
+        })
+        .unwrap();
+
+    if !element
+        .try_property::<bool>("enable-last-sample")
+        .unwrap_or_else(|e| {
+            panic!(
+                "No property `enable-last-sample` on {}: {:?}",
+                element_name, e
+            )
+        })
+    {
+        panic!("Property `enable-last-sample` not `true` on: {} - you need to set it when defining the pipeline", element_name);
+    }
+
+    element
+        .try_property::<gst::Sample>("last-sample")
+        .unwrap_or_else(|e| panic!("No property `last-sample` on {}: {:?}", element_name, e))
+}
+
+#[then(expr = "The user can see a frame on {word}")]
+pub fn check_last_frame(w: &mut World, element_name: String) -> Result<(), anyhow::Error> {
+    let _ = w.pipeline.state(gst::ClockTime::NONE);
+
+    get_last_frame(w, &element_name);
+
+    Ok(())
+}
+
+#[then(expr = "I should see significant color {word} on {word}")]
+pub async fn check_significant_color(
+    w: &mut World,
+    expected: String,
+    sink_name: String,
+) -> Result<(), anyhow::Error> {
+    let start = SystemTime::now();
+    let mut first_expected: Option<SystemTime> = None;
+
+    loop {
+        let sample = get_last_frame(w, &sink_name);
+
+        let in_info = gstvideo::VideoInfo::from_caps(sample.caps().expect("No caps in sample"))
+            .unwrap_or_else(|_| panic!("Invalid video caps: {}", sample.caps().unwrap()));
+
+        let out_info = gstvideo::VideoInfo::builder(
+            gstvideo::VideoFormat::Argb,
+            in_info.width(),
+            in_info.height(),
+        )
+        .fps(in_info.fps())
+        .build()
+        .unwrap();
+
+        let videoconvert = gstvideo::VideoConverter::new(&in_info, &out_info, None)
+            .expect("Could not create VideoConverter");
+        let frame =
+            gstvideo::VideoFrame::from_buffer_readable(sample.buffer_owned().unwrap(), &in_info)
+                .expect("Could not map frame");
+
+        let buffer = gst::Buffer::with_size(out_info.size()).unwrap();
+        let mut outframe = gstvideo::VideoFrame::from_buffer_writable(buffer, &out_info).unwrap();
+        videoconvert.frame(&frame, &mut outframe);
+        let res = match color_thief::get_palette(
+            outframe.plane_data(0).unwrap(),
+            color_thief::ColorFormat::Argb,
+            5,
+            2,
+        ) {
+            Err(e) => panic!("Could not extract colors: {:?}", e),
+            Ok(v) => v,
+        };
+
+        // let expected = color_name::Color::val()
+        //     .by_string(expected.to_lowercase())
+        //     .unwrap();
+        let expected = expected.to_lowercase();
+        for rgb in &res {
+            let color = color_name::Color::similar([rgb.r, rgb.g, rgb.b]).to_lowercase();
+
+            gst::debug!(CAT, "Got {}", color);
+
+            // let almost_eq = |lhs: u8, rhs: u8, epsilon: u8| -> bool {
+            //     if lhs == rhs {
+            //         true
+            //     } else {
+            //         let delta = rhs as i32 - lhs as i32;
+            //         delta.abs() <= epsilon.into()
+            //     }
+            // };
+            // let epsilon = tolerance as u8;
+            // dbg!(&rgb);
+            // dbg!(&expected);
+            // if almost_eq(rgb.r, expected[0], epsilon)
+            //     && almost_eq(rgb.g, expected[1], epsilon)
+            //     && almost_eq(rgb.b, expected[2], epsilon)
+            if color == expected {
+                if first_expected.is_none() {
+                    let _ = first_expected.insert(SystemTime::now());
+                }
+
+                // Ensuring that we have the right color for 1second
+                if first_expected.unwrap().elapsed().unwrap().as_millis() >= 1000 {
+                    gst::info!(
+                        CAT,
+                        "Got right color after {}ms",
+                        first_expected
+                            .unwrap()
+                            .duration_since(start)
+                            .unwrap()
+                            .as_millis()
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Wait for next frame, ideally we should.. exit the loop and panic and n iterations?
+        task::sleep(Duration::from_millis(
+            1000 / (in_info.fps().numer() as u64 / in_info.fps().denom() as u64),
+        ))
+        .await;
+    }
+}
