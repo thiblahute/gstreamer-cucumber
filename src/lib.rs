@@ -5,6 +5,7 @@ use gst::glib;
 use gst::prelude::*;
 use gstvalidate::prelude::*;
 use once_cell::sync::Lazy;
+use tempfile::NamedTempFile;
 use std::cmp;
 use std::convert::Infallible;
 use std::env;
@@ -14,10 +15,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
+use std::io::Write;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
-        "validate-cucumber",
+        "cucumber",
         gst::DebugColorFlags::empty(),
         Some("🥒"),
     )
@@ -29,7 +31,7 @@ pub struct World {
     runner: Option<gstvalidate::Runner>,
     monitor: Option<gstvalidate::Monitor>,
 
-    validateconfigs: gst::Caps,
+    validateconfig: Option<NamedTempFile>,
 
     pub current_feature_path: Option<PathBuf>,
     pub extra_data: gst::Structure,
@@ -78,7 +80,7 @@ impl cucumber::World for World {
             pipeline: gst::Pipeline::new(None),
             runner: None,
             monitor: None,
-            validateconfigs: gst::Caps::new_empty(),
+            validateconfig: None,
 
             current_feature_path: None,
             extra_data: gst::Structure::new_empty("extra"),
@@ -188,25 +190,24 @@ fn validate_no_reports(w: &mut World) -> Result<(), anyhow::Error> {
 
 #[given(regex = r"The validate configuration '(.*)'$")]
 pub fn add_validate_config(w: &mut World, config: String) {
-    dbg!(&config);
-    let structure = gst::Structure::from_str(&config)
-        .unwrap_or_else(|e| panic!("Invalid config: {}: {:?}", config, e));
+    if w.validateconfig.is_none() {
+        w.validateconfig = Some(NamedTempFile::new().expect("Could not create temporary file"));
+    }
 
-    w.validateconfigs
-        .get_mut()
-        .unwrap()
-        .append_structure(structure);
+    writeln!(w.validateconfig.as_ref().unwrap(), "{}", config).expect("Couldn't write temprory config");
 }
 
 #[given(expr = "Validate is activated")]
 pub fn activate_validate(w: &mut World) {
     debug_assert!(w.runner.is_none(), "Validate has already been activated");
 
-    if !w.validateconfigs.is_empty() {
-        let configs_str = w.validateconfigs.serialize(gst::SerializeFlags::NONE);
+    if let Some(validateconfig) = w.validateconfig.take() {
+        let config_temp_path = validateconfig.into_temp_path();
+        let path = config_temp_path.as_os_str().to_str().expect("Invalid config temporary file").to_string();
+        gst::debug!(CAT, "Got config: {}", &path);
+        config_temp_path.keep().expect("Could not keep config");
 
-        gst::debug!(CAT, "Got configs: {}", configs_str);
-        env::set_var("GST_VALIDATE_CONFIG", &configs_str);
+        env::set_var("GST_VALIDATE_CONFIG", path);
     }
 
     gstvalidate::init();
